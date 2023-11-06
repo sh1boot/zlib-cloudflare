@@ -356,65 +356,24 @@ static inline unsigned char FAR* chunkset_core(
     unsigned char FAR* out,
     unsigned period,
     unsigned len) {
-  z_vec128i_t v;
-  const int bump = ((len - 1) % sizeof(v)) + 1;
-
-  switch (period) {
-    case 1:
-      v = v_load8_dup(out - 1);
-      v_store_128(out, v);
-      out += bump;
-      len -= bump;
-      while (len > 0) {
-        v_store_128(out, v);
-        out += sizeof(v);
-        len -= sizeof(v);
-      }
-      return out;
-    case 2:
-      v = v_load16_dup(out - 2);
-      v_store_128(out, v);
-      out += bump;
-      len -= bump;
-      if (len > 0) {
-        v = v_load16_dup(out - 2);
-        do {
-          v_store_128(out, v);
-          out += sizeof(v);
-          len -= sizeof(v);
-        } while (len > 0);
-      }
-      return out;
-    case 4:
-      v = v_load32_dup(out - 4);
-      v_store_128(out, v);
-      out += bump;
-      len -= bump;
-      if (len > 0) {
-        v = v_load32_dup(out - 4);
-        do {
-          v_store_128(out, v);
-          out += sizeof(v);
-          len -= sizeof(v);
-        } while (len > 0);
-      }
-      return out;
-    case 8:
-      v = v_load64_dup(out - 8);
-      v_store_128(out, v);
-      out += bump;
-      len -= bump;
-      if (len > 0) {
-        v = v_load64_dup(out - 8);
-        do {
-          v_store_128(out, v);
-          out += sizeof(v);
-          len -= sizeof(v);
-        } while (len > 0);
-      }
-      return out;
+  if (period < len && period < CHUNKCOPY_CHUNK_SIZE) {
+    unsigned char FAR* end = out + len;
+    int p0 = period;
+    int avail = period;
+    *out = *(out - period);
+    ++out;
+    ++avail;
+    if (period <= 1) period += period;
+    for (int seg = 1; seg < CHUNKCOPY_CHUNK_SIZE; seg <<= 1) {
+        Z_BUILTIN_MEMCPY(out, out - period, seg);
+        out += seg;
+        period += period;
+        avail += seg;
+        period -= (period > avail) ? p0 : 0;
+    }
+    if (out >= end) return end;
+    len -= CHUNKCOPY_CHUNK_SIZE;
   }
-  out = chunkunroll_relaxed(out, &period, &len);
   return chunkcopy_core(out, out - period, len);
 }
 
