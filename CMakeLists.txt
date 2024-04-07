@@ -5,6 +5,7 @@ project(zlib C)
 include(CheckIncludeFile)
 include(CheckTypeSize)
 include(CheckFunctionExists)
+include(CheckSymbolExists)
 
 # Check include files
 check_include_file(sys/types.h HAVE_SYS_TYPES_H)
@@ -101,6 +102,12 @@ if(UNIX OR MINGW)
                 add_definitions(-DHAS_PCLMUL)
             endif()
         endif()
+
+        # Rather than test what the compiler is capable of, leave feature
+        # choices in the hands of the user via CFLAGS.  Enable RVV only if
+        # the compiler is configured to use it -- either implicitly (eg.,
+        # -mtune=native) or explicitly (eg., -march=rv64gcv).
+        check_symbol_exists(__riscv_v "" RISCV_VECTOR)
     endif()
 elseif(MSVC)
     set(CMAKE_DEBUG_POSTFIX "d")
@@ -182,6 +189,14 @@ if(UNIX OR MINGW)
     # append "crc_simd.c" and compile with "pclmul" if supported by compiler
     if(HAS_PCLMUL)
         list(APPEND ZLIB_SRCS crc32_simd.c)
+    endif()
+
+    # append "inffast_chunk.c" and "adler32_simd.c" for RISC-V Vector
+    if(RISCV_VECTOR)
+        list(APPEND ZLIB_SRCS inffast_chunk.c adler32_simd.c)
+        add_definitions(-DINFLATE_CHUNK_READ_64LE)
+        add_definitions(-DADLER32_SIMD_RVV)
+        add_definitions(-DINFLATE_CHUNK_GENERIC)
     endif()
 endif()
 
