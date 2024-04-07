@@ -41,7 +41,7 @@ static INLINE_ALWAYS int unwind_chunk(uint8_t* out, int d) {
         out += seg;
         d += d;
         avail += seg;
-        d -= (d <= avail) ? d0 : 0;
+        d -= (d > avail) ? d0 : 0;
     }
     return d;
 }
@@ -66,7 +66,7 @@ static INLINE_ALWAYS void omnicopy258(uint8_t* dptr, uint8_t const* sptr, int le
             dptr += seg;
             offset += offset;
             avail += seg;
-            offset -= (offset <= avail) ? off0 : 0;
+            offset -= (offset > avail) ? off0 : 0;
         }
 #else
         offset = unwind_chunk(dptr, offset);
@@ -235,6 +235,9 @@ static INLINE_ALWAYS void inflate_fastish_core(struct inflate_state FAR *state, 
     uint64_t hold = state->hold;                        /* bit buffer */
     unsigned int bits = state->bits;                    /* bits in bit buffer */
 
+    if (CAN_ASSUME(OUTPUT_APLENTY) && avail_out < 8) return;
+    if (CAN_ASSUME(INPUT_APLENTY) && avail_in < sizeof(uint64_t)) return;
+
     state->mode = LEN;
 
     code const* len_table = state->lencode;
@@ -249,7 +252,7 @@ static INLINE_ALWAYS void inflate_fastish_core(struct inflate_state FAR *state, 
     uint64_t hold_rewind = hold;
     int bits_rewind = bits;
 
-    while (avail_out > 0) {
+    while (avail_out > (CAN_ASSUME(OUTPUT_APLENTY) ? 7 : 0)) {
         /* Ideally (64-bits)/8, but letting bits==64 causes an illegal shift elsewhere. */
         int chomp_size = (63u - bits) >> 3;
         if (avail_in < sizeof(uint64_t)) {
@@ -297,6 +300,69 @@ static INLINE_ALWAYS void inflate_fastish_core(struct inflate_state FAR *state, 
             *outptr = (uint8_t)here.val;
             outptr++;
             avail_out--;
+            if (CAN_ASSUME(INPUT_APLENTY) && CAN_ASSUME(OUTPUT_APLENTY)) {
+                Tracevv((stderr, "hold: %0*lb (%d bits)\n", bits, hold, bits));
+                // above consumed up to 15 bits, of _at least_ 56 bits; 31 bits to go...
+                here = lenptr[hold & lenpeekmask];
+                if (here.op == 0) {
+                    bit_stash = hold & ~(~0ul << here.bits);
+                    hold >>= here.bits;
+                    bits -= here.bits;
+                    Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
+                            "inflate: 2       literal '%c\t\t! %0*lb\n" :
+                            "inflate: 2       literal %d\t\t! %0*lb\n",
+                            here.val, here.bits, (unsigned long)bit_stash));
+                    *outptr = (uint8_t)here.val;
+                    outptr++;
+                    avail_out--;
+
+                    // above consumed up to 10 bits, of _at least_ 31 bits; 21 bits to go...
+                    here = lenptr[hold & lenpeekmask];
+                    if (here.op == 0) {
+                        bit_stash = hold & ~(~0ul << here.bits);
+                        hold >>= here.bits;
+                        bits -= here.bits;
+                        Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
+                                "inflate: 3       literal '%c\t\t! %0*lb\n" :
+                                "inflate: 3       literal %d\t\t! %0*lb\n",
+                                here.val, here.bits, (unsigned long)bit_stash));
+                        *outptr = (uint8_t)here.val;
+                        outptr++;
+                        avail_out--;
+
+                        // above consumed up to 10 bits, of _at least_ 21 bits; 11 bits to go...
+                        here = lenptr[hold & lenpeekmask];
+                        if (here.op == 0) {
+                            bit_stash = hold & ~(~0ul << here.bits);
+                            hold >>= here.bits;
+                            bits -= here.bits;
+                            Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
+                                    "inflate: 4       literal '%c\t\t! %0*lb\n" :
+                                    "inflate: 4       literal %d\t\t! %0*lb\n",
+                                    here.val, here.bits, (unsigned long)bit_stash));
+                            *outptr = (uint8_t)here.val;
+                            outptr++;
+                            avail_out--;
+#if 0 // this is a bit silly, now
+                            // above consumed up to 10 bits, of _at least_ 11 bits; that'll do!
+                            here = lenptr[hold & lenpeekmask];
+                            if (here.op == 0) {
+                                bit_stash = hold & ~(~0ul << here.bits);
+                                hold >>= here.bits;
+                                bits -= here.bits;
+                                Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
+                                        "inflate: 5       literal '%c\t\t! %0*lb\n" :
+                                        "inflate: 5       literal %d\t\t! %0*lb\n",
+                                        here.val, here.bits, (unsigned long)bit_stash));
+                                *outptr = (uint8_t)here.val;
+                                outptr++;
+                                avail_out--;
+                            }
+#endif
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -354,6 +420,7 @@ static INLINE_ALWAYS void inflate_fastish_core(struct inflate_state FAR *state, 
                     state_length, state_offset,
                     here2.bits, (unsigned long)bit_stash2,
                     here.bits, (unsigned long)bit_stash));
+        // TODO: calculate this correctlyer.
         int hardstop = CANNOT_ASSUME(NOHARDSTOP) && (avail_out < CHUNKCOPY_CHUNK_SIZE);
         int output_so_far = (output_size - avail_out);
         int copy = state_length;
@@ -427,11 +494,15 @@ static INLINE_ALWAYS void inflate_fastish_core(struct inflate_state FAR *state, 
     state->was = state->length = state->offset = 0;
 }
 
+static INLINE_NEVER void inflate_fastest(struct inflate_state FAR *state, z_streamp strm, unsigned output_size) {
+    inflate_fastish_core(state, strm, output_size, ASSUME_INPUT_APLENTY | ASSUME_OUTPUT_APLENTY);
+}
+
 static INLINE_NEVER void inflate_fasterish(struct inflate_state FAR *state, z_streamp strm, unsigned output_size) {
     inflate_fastish_core(state, strm, output_size, ASSUME_INPUT_APLENTY);
 }
 
-static INLINE_NEVER void inflate_fastish_tail(struct inflate_state FAR *state, z_streamp strm, unsigned output_size) {
+static INLINE_NEVER void inflate_tail(struct inflate_state FAR *state, z_streamp strm, unsigned output_size) {
     inflate_fastish_core(state, strm, output_size, 0);
 }
 
@@ -445,8 +516,9 @@ void ZLIB_INTERNAL inffast_outcopy(uint8_t* outptr, int distance, int length) {
 
 void ZLIB_INTERNAL inflate_fastish(z_streamp strm, unsigned output_size) {
     struct inflate_state FAR *state = (struct inflate_state FAR *)strm->state;
-    inflate_fasterish(state, strm, output_size);
-    if (state->mode == LEN) inflate_fastish_tail(state, strm, output_size);
+    inflate_fastest(state, strm, output_size);
+    if (state->mode == LEN) inflate_fasterish(state, strm, output_size);
+    if (state->mode == LEN) inflate_tail(state, strm, output_size);
 #ifdef ZLIB_DEBUG
     if (state->mode == LEN) {
         if (strm->avail_in > 0 && strm->avail_out > 0) {
