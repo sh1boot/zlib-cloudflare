@@ -1106,9 +1106,10 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
                 break;
             }
 #endif
+        case MATCH:
             if (left == 0) goto inf_leave;
             RESTORE();
-            inflate_fastish(strm, out);
+            inflate_core(strm, out);
             LOAD();
             if (state->mode != LEN && state->mode != MATCH) {
                 Tracev((stderr, "continuing main loop because mode is %d.\n",
@@ -1116,42 +1117,6 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
                 break;
             }
             goto inf_leave;
-        case MATCH:
-            /* Occasionally the previous back reference will be left incomplete
-             * because there wasn't enough output buffer.  In that case, pick
-             * up the leftovers here, before re-entering the main loop above.
-             */
-            if (left == 0) goto inf_leave;
-            {
-                int output_so_far = (out - left);
-                copy = state->length;
-                if (copy > left) copy = left;
-
-                /* We try not to rely on the window and hope the output buffer is large enough */
-                if (__builtin_expect(state->offset > output_so_far, 0)) {         /* copy from window */
-                    int windist = state->offset - output_so_far;
-                    int wcopy = copy < windist ? copy : windist;
-                    if (inffast_wincopy(put, state->window, state->wsize, state->whave, state->wnext, windist, wcopy) != 0 && state->sane) {
-                        strm->msg = (char *)"invalid distance too far back";
-                        state->mode = BAD;
-                        break;
-                    }
-                    put += wcopy;
-                    left -= wcopy;
-                    copy -= wcopy;
-                    state->length -= wcopy;
-                    if (state->length == 0) state->mode = LEN;
-                    if (copy == 0) break;
-                }
-
-                /* copy from output */
-                inffast_outcopy(put, state->offset, copy);
-                put += copy;
-                left -= copy;
-                state->length -= copy;
-                if (state->length == 0) state->mode = LEN;
-            }
-            break;
         case CHECK:
             if (state->wrap) {
                 NEEDBITS(32);

@@ -8,6 +8,15 @@
 #include "inflate.h"
 #include "inffast.h"
 
+#ifdef ZLIB_DEBUG
+#undef NDEBUG
+#else
+#if !defined NDEBUG
+#define NDEBUG
+#endif
+#endif
+#include <assert.h>
+
 #ifndef CHUNKCOPY_CHUNK_SIZE
 #define CHUNKCOPY_CHUNK_SIZE 32
 #endif
@@ -18,12 +27,14 @@
 #define ASSUME_NOOVERLAP 4
 #define ASSUME_INPUT_APLENTY 8
 #define ASSUME_OUTPUT_APLENTY 16
+#define PLENTY_OF_OUTPUT (258 + CHUNKCOPY_CHUNK_SIZE)
+
 #define CAN_ASSUME(shortcut) ((~assumptions & ASSUME_##shortcut) == 0)
 #define CANNOT_ASSUME(shortcut) ((~assumptions & ASSUME_##shortcut) != 0)
 
 #define INLINE_NEVER __attribute__((noinline))
 #define INLINE_ALWAYS inline __attribute__((always_inline))
-#if 0
+#if defined ZLIB_DEBUG
 #define INLINE_UNLESS_DEBUG INLINE_NEVER
 #else
 #define INLINE_UNLESS_DEBUG INLINE_ALWAYS
@@ -54,34 +65,20 @@ static INLINE_ALWAYS void omnicopy258(uint8_t* dptr, uint8_t const* sptr, int le
     size_t offset = dptr - sptr;
     size_t vl = (len - 1) % CHUNKCOPY_CHUNK_SIZE + 1;
     if (CANNOT_ASSUME(NOOVERLAP) && offset < CHUNKCOPY_CHUNK_SIZE) {
-#if 1
-        int off0 = offset;
-        size_t avail = offset;
-        *dptr = *(dptr - offset);
-        ++dptr;
-        ++avail;
-        if (offset <= 1) offset += offset;
-        for (int seg = 1; seg < CHUNKCOPY_CHUNK_SIZE; seg <<= 1) {
-            zmemcpy(dptr, dptr - offset, seg);
-            dptr += seg;
-            offset += offset;
-            avail += seg;
-            offset -= (offset > avail) ? off0 : 0;
-        }
-#else
         offset = unwind_chunk(dptr, offset);
-#endif
-        sptr = dptr - offset;
-    } else {
+    }
+    else {
         zmemcpy(dptr, sptr, CHUNKCOPY_CHUNK_SIZE);
     }
     dptr += vl;
     sptr += vl;
     len -= vl;
     while (len > 0) {
-        zmemcpy(dptr, sptr, CHUNKCOPY_CHUNK_SIZE);
+        uint64_t chunk[(CHUNKCOPY_CHUNK_SIZE + 7) / 8];
+        zmemcpy(chunk, sptr, CHUNKCOPY_CHUNK_SIZE);
+        zmemcpy(dptr, chunk, CHUNKCOPY_CHUNK_SIZE);
         dptr += CHUNKCOPY_CHUNK_SIZE;
-        sptr += CHUNKCOPY_CHUNK_SIZE;
+        sptr = dptr - offset;
         len -= CHUNKCOPY_CHUNK_SIZE;
     }
 }
@@ -136,8 +133,27 @@ static INLINE_UNLESS_DEBUG void rvv_copy258_overlap(uint8_t* dptr, int offset, i
 #define COPY258_NOOVERLAP_NOHARDSTOP(d, s, l) rvv_copy258_nooverlap(d, s, l)
 #define COPY258_OVERLAP_HARDSTOP(d, o, l) rvv_copy258_overlap(d, o, l)
 #define COPY258_OVERLAP_NOHARDSTOP(d, o, l) rvv_copy258_overlap(d, o, l)
-#else
+#define TARGET_EXTRA_ASSUMPTIONS ASSUME_NOHARDSTOP
+#elif defined __x86_64__
+static INLINE_UNLESS_DEBUG uint8_t* memcpy_fsrm(uint8_t* dptr, uint8_t const* sptr, int len) {
+    asm volatile ("rep movsb" : "+D" (dptr), "+S" (sptr), "+c" (len));
+    return dptr;
+}
 
+static INLINE_UNLESS_DEBUG void copy258_overlap_nohardstop(uint8_t* dptr, int offset, int len) {
+    omnicopy258(dptr, dptr - offset, len, ASSUME_NOHARDSTOP);
+}
+
+static INLINE_UNLESS_DEBUG void copy258_overlap_hardstop(uint8_t* dptr, int offset, int len) {
+    omnicopy258(dptr, dptr - offset, len, 0);
+}
+
+#define COPY258_NOOVERLAP_HARDSTOP(d, s, l) memcpy_fsrm(d, s, l)
+#define COPY258_NOOVERLAP_NOHARDSTOP(d, s, l) memcpy_fsrm(d, s, l)
+#define COPY258_OVERLAP_HARDSTOP(d, o, l) copy258_overlap_hardstop(d, o, l)
+#define COPY258_OVERLAP_NOHARDSTOP(d, o, l) copy258_overlap_nohardstop(d, o, l)
+#define TARGET_EXTRA_ASSUMPTIONS 0
+#else
 static INLINE_UNLESS_DEBUG void copy258_nooverlap_nohardstop(uint8_t* dptr, uint8_t const* sptr, int len) {
     omnicopy258(dptr, sptr, len, ASSUME_NOOVERLAP | ASSUME_NOHARDSTOP);
 }
@@ -158,6 +174,7 @@ static INLINE_UNLESS_DEBUG void copy258_overlap_hardstop(uint8_t* dptr, int offs
 #define COPY258_NOOVERLAP_NOHARDSTOP(d, s, l) copy258_nooverlap_nohardstop(d, s, l)
 #define COPY258_OVERLAP_HARDSTOP(d, o, l) copy258_overlap_hardstop(d, o, l)
 #define COPY258_OVERLAP_NOHARDSTOP(d, o, l) copy258_overlap_nohardstop(d, o, l)
+#define TARGET_EXTRA_ASSUMPTIONS 0
 #endif
 
 static INLINE_UNLESS_DEBUG int windowcopy(uint8_t* outptr, uint8_t const* window, int wsize, int whave, int wnext, int offset, int copy) {
@@ -194,19 +211,10 @@ static INLINE_UNLESS_DEBUG int windowcopy(uint8_t* outptr, uint8_t const* window
 }
 
 
-/* Clear the input bit accumulator */
-#define REPLACEBITS() \
-    do { \
-        int replace_size = bits >> 3; \
-        bits -= replace_size * 8; \
-        hold &= ~(~0ull << bits); \
-        inptr -= replace_size; \
-        avail_in += replace_size; \
-    } while (0)
 /* Restore state from registers in inflate() */
 #define RESTORE() \
     do { \
-        /* assert(bits <= 8 * sizeof(state->hold)) */ \
+        assert(bits <= 8 * sizeof(state->hold)); \
         strm->next_out = outptr; \
         strm->avail_out = avail_out; \
         strm->next_in = inptr; \
@@ -224,35 +232,35 @@ static INLINE_UNLESS_DEBUG int windowcopy(uint8_t* outptr, uint8_t const* window
     } while (0)
 
 static INLINE_ALWAYS uint64_t read_64le(uint8_t const* ptr) {
-    return *(uint64_t const*)ptr;
+    uint64_t r = *(uint64_t const*)ptr;
+#if defined __BYTE_ORDER__ && __BYTE_ORDER == __ORDER_BIG_ENDIAN__
+    return __builtin_bswap64(r);
+#else
+    return r;
+#endif
 }
 
-static INLINE_ALWAYS void inflate_fastish_core(struct inflate_state FAR *state, z_streamp strm, unsigned output_size, int const assumptions) {
-    unsigned char FAR* outptr = strm->next_out;            /* next output */
-    z_const unsigned char FAR* inptr = strm->next_in;    /* next input */
-    unsigned int avail_out = strm->avail_out;                /* available output */
-    unsigned int avail_in = strm->avail_in;                 /* available input */
+static INLINE_ALWAYS void inflate_core_impl(struct inflate_state FAR *state, z_streamp strm, unsigned output_size, int const assumptions) {
+    unsigned char FAR* outptr = strm->next_out;         /* next output */
+    z_const unsigned char FAR* inptr = strm->next_in;   /* next input */
+    unsigned int avail_out = strm->avail_out;           /* available output */
+    unsigned int avail_in = strm->avail_in;             /* available input */
     uint64_t hold = state->hold;                        /* bit buffer */
     unsigned int bits = state->bits;                    /* bits in bit buffer */
 
-    if (CAN_ASSUME(OUTPUT_APLENTY) && avail_out < 8) return;
+    if (CAN_ASSUME(OUTPUT_APLENTY) && avail_out < PLENTY_OF_OUTPUT) return;
     if (CAN_ASSUME(INPUT_APLENTY) && avail_in < sizeof(uint64_t)) return;
 
     state->mode = LEN;
 
-    code const* len_table = state->lencode;
-    code const* dist_table = state->distcode;
-    int state_was = 0, state_length = 0;
-    int state_offset = 0;
-
-    code const* lenptr = state->lencode;
+    code const* lentbl = state->lencode;
     uint32_t lenpeekmask = ~(~0ull << state->lenbits);
-    code const* distptr = state->distcode;
+    code const* disttbl = state->distcode;
     uint32_t distpeekmask = ~(~0ull << state->distbits);
     uint64_t hold_rewind = hold;
     int bits_rewind = bits;
 
-    while (avail_out > (CAN_ASSUME(OUTPUT_APLENTY) ? 7 : 0)) {
+    while (avail_out > (CAN_ASSUME(OUTPUT_APLENTY) ? PLENTY_OF_OUTPUT - 1 : 0)) {
         /* Ideally (64-bits)/8, but letting bits==64 causes an illegal shift elsewhere. */
         int chomp_size = (63u - bits) >> 3;
         if (avail_in < sizeof(uint64_t)) {
@@ -265,7 +273,8 @@ static INLINE_ALWAYS void inflate_fastish_core(struct inflate_state FAR *state, 
                 avail_in--;
                 chomp_size--;
             }
-        } else {
+        }
+        else {
             hold |= read_64le(inptr) << bits;
             bits += chomp_size * 8;
             inptr += chomp_size; 
@@ -276,218 +285,218 @@ static INLINE_ALWAYS void inflate_fastish_core(struct inflate_state FAR *state, 
         hold_rewind = hold;
         bits_rewind = bits;
 
-        code here = lenptr[hold & lenpeekmask];
-        NEEDBITS(here.bits, "length code");
+        code match = lentbl[hold & lenpeekmask];
+        NEEDBITS(match.bits, "length code");
 
-        if (here.op && (here.op & 0xf0) == 0) {
-            unsigned long mask = ~(~0ul << (here.bits + here.op));
-            code last = here;
-            here = lenptr[last.val + ((hold & mask) >> last.bits)];
-            here.bits += last.bits;  // TODO: fold into table?
-            NEEDBITS(here.bits, "length bounce");
+        if (0 < match.op && match.op < 16) {
+            /* Continuation code; match.op&15 is number of extra bits needed
+             * for the next table look-up. */
+            code bounce = match;
+            unsigned long mask = ~(~0ul << bounce.op);
+            match = lentbl[bounce.val + ((hold & mask) >> bounce.bits)];
+            NEEDBITS(match.bits, "length bounce");
+            /* assume two subtables cannot happen */
         }
         uint64_t bit_stash_raw = hold;
-        uint64_t bit_stash = hold & ~(~0ul << here.bits);
+        uint64_t bit_stash = hold & ~(~0ul << match.bits);
 
-        hold >>= here.bits;
-        bits -= here.bits;
+        hold >>= match.bits;
+        bits -= match.bits;
 
-        if (here.op == 0) {
-            Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
+        if (match.op == 0) {
+            /* Literal */
+            Tracevv((stderr, match.val >= 0x20 && match.val < 0x7f ?
                     "inflate:         literal '%c\t\t! %0*lb\n" :
                     "inflate:         literal %d\t\t! %0*lb\n",
-                    here.val, here.bits, (unsigned long)bit_stash));
-            *outptr = (uint8_t)here.val;
+                    match.val, match.bits, (unsigned long)bit_stash));
+            *outptr = (uint8_t)match.val;
             outptr++;
             avail_out--;
-            if (CAN_ASSUME(INPUT_APLENTY) && CAN_ASSUME(OUTPUT_APLENTY)) {
-                Tracevv((stderr, "hold: %0*lb (%d bits)\n", bits, hold, bits));
-                // above consumed up to 15 bits, of _at least_ 56 bits; 31 bits to go...
-                here = lenptr[hold & lenpeekmask];
-                if (here.op == 0) {
-                    bit_stash = hold & ~(~0ul << here.bits);
-                    hold >>= here.bits;
-                    bits -= here.bits;
-                    Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
+            if (CAN_ASSUME(INPUT_APLENTY) && (CAN_ASSUME(OUTPUT_APLENTY) || avail_out >= 3)) {
+                /* Above consumed up to 15 bits, we started with 56 bits, so
+                 * we can decode another 41 bits without refill.  Let's try!
+                 */
+                match = lentbl[hold & lenpeekmask];
+                if (match.op == 0) {
+                    /* Another literal -- one which fits in the base table */
+                    bit_stash = hold & ~(~0ul << match.bits);
+                    hold >>= match.bits;
+                    bits -= match.bits;
+                    Tracevv((stderr, match.val >= 0x20 && match.val < 0x7f ?
                             "inflate: 2       literal '%c\t\t! %0*lb\n" :
                             "inflate: 2       literal %d\t\t! %0*lb\n",
-                            here.val, here.bits, (unsigned long)bit_stash));
-                    *outptr = (uint8_t)here.val;
+                            match.val, match.bits, (unsigned long)bit_stash));
+                    *outptr = (uint8_t)match.val;
                     outptr++;
                     avail_out--;
 
-                    // above consumed up to 10 bits, of _at least_ 31 bits; 21 bits to go...
-                    here = lenptr[hold & lenpeekmask];
-                    if (here.op == 0) {
-                        bit_stash = hold & ~(~0ul << here.bits);
-                        hold >>= here.bits;
-                        bits -= here.bits;
-                        Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
+                    /* Base table size is currently hard-coded to 10 bits (but
+                     * let's assume 12).  So we still have at least 29 bits
+                     * left.
+                     */
+                    match = lentbl[hold & lenpeekmask];
+                    if (match.op == 0) {
+                        bit_stash = hold & ~(~0ul << match.bits);
+                        hold >>= match.bits;
+                        bits -= match.bits;
+                        Tracevv((stderr, match.val >= 0x20 && match.val < 0x7f ?
                                 "inflate: 3       literal '%c\t\t! %0*lb\n" :
                                 "inflate: 3       literal %d\t\t! %0*lb\n",
-                                here.val, here.bits, (unsigned long)bit_stash));
-                        *outptr = (uint8_t)here.val;
+                                match.val, match.bits, (unsigned long)bit_stash));
+                        *outptr = (uint8_t)match.val;
                         outptr++;
                         avail_out--;
 
-                        // above consumed up to 10 bits, of _at least_ 21 bits; 11 bits to go...
-                        here = lenptr[hold & lenpeekmask];
-                        if (here.op == 0) {
-                            bit_stash = hold & ~(~0ul << here.bits);
-                            hold >>= here.bits;
-                            bits -= here.bits;
-                            Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
+                        /* We still have at least 17 bits left. */
+                        match = lentbl[hold & lenpeekmask];
+                        if (match.op == 0) {
+                            bit_stash = hold & ~(~0ul << match.bits);
+                            hold >>= match.bits;
+                            bits -= match.bits;
+                            Tracevv((stderr, match.val >= 0x20 && match.val < 0x7f ?
                                     "inflate: 4       literal '%c\t\t! %0*lb\n" :
                                     "inflate: 4       literal %d\t\t! %0*lb\n",
-                                    here.val, here.bits, (unsigned long)bit_stash));
-                            *outptr = (uint8_t)here.val;
+                                    match.val, match.bits, (unsigned long)bit_stash));
+                            *outptr = (uint8_t)match.val;
                             outptr++;
                             avail_out--;
-#if 0 // this is a bit silly, now
-                            // above consumed up to 10 bits, of _at least_ 11 bits; that'll do!
-                            here = lenptr[hold & lenpeekmask];
-                            if (here.op == 0) {
-                                bit_stash = hold & ~(~0ul << here.bits);
-                                hold >>= here.bits;
-                                bits -= here.bits;
-                                Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
-                                        "inflate: 5       literal '%c\t\t! %0*lb\n" :
-                                        "inflate: 5       literal %d\t\t! %0*lb\n",
-                                        here.val, here.bits, (unsigned long)bit_stash));
-                                *outptr = (uint8_t)here.val;
-                                outptr++;
-                                avail_out--;
-                            }
-#endif
+
+                            /* Questionable returns beyond this point. Let's stop. */
                         }
                     }
                 }
             }
-            continue;
         }
+        else if (match.op < 32) {
+            /* match */
+            int extra = (unsigned)match.op & 15;
+            int state_length = (unsigned)match.val;
+            state_length += (bit_stash << extra) >> match.bits;
+            int state_was = state_length;
 
-        // do this after literal handling, so we don't contaminate state_length
-        int extra = (unsigned)here.op & 15;
-        state_length = (unsigned)here.val;
-        state_length += (bit_stash << extra) >> here.bits;
-
-        code here2 = distptr[hold & distpeekmask];
-        NEEDBITS(here2.bits, "distance code");
-        if ((here2.op & 0xf0) == 0) {
-            unsigned long mask = ~(~0ul << (here2.bits + here2.op));
-            code last = here2;
-            here2 = distptr[last.val + ((hold & mask) >> last.bits)];
-            here2.bits += last.bits;  // TODO: fold into table?
-            NEEDBITS(here2.bits, "distance bounce");
-        }
-
-        uint64_t bit_stash2 = hold & ~(~0ul << here2.bits);
-
-        if (here.op >= 32) {
-            if (here.op & 32) {
-                Tracevv((stderr, "inflate:         end of block\n"));
-                state->mode = TYPE;
-                break;
+            code distance = disttbl[hold & distpeekmask];
+            NEEDBITS(distance.bits, "distance code");
+            if (distance.op < 16) {
+                code bounce = distance;
+                unsigned long mask = ~(~0ul << bounce.op);
+                distance = disttbl[bounce.val + ((hold & mask) >> bounce.bits)];
+                NEEDBITS(distance.bits, "distance bounce");
+                /* assume two subtables cannot happen */
             }
-            if (here.op & 64) {
-                strm->msg = (char *)"invalid literal/length code";
+
+            uint64_t bit_stash2 = hold & ~(~0ul << distance.bits);
+            hold >>= distance.bits;
+            bits -= distance.bits;
+
+            extra = (unsigned)distance.op & 15;
+            int state_offset = (unsigned)distance.val;
+            state_offset += (bit_stash2 << extra) >> distance.bits;
+            if (distance.op >= 32) {
+                strm->msg = (char *)"invalid distance code";
                 state->mode = BAD;
                 break;
             }
-        }
-        hold >>= here2.bits;
-        bits -= here2.bits;
-
-        state_was = state_length;
-
-        if (here2.op & 64) {
-            strm->msg = (char *)"invalid distance code";
-            state->mode = BAD;
-            break;
-        }
-
-        extra = (unsigned)here2.op & 15;
-        state_offset = (unsigned)here2.val;
-        state_offset += (bit_stash2 << extra) >> here2.bits;
 #ifdef INFLATE_STRICT
-        if (state_offset > state->dmax) {
-            strm->msg = (char *)"invalid distance too far back";
-            state->mode = BAD;
-            break;
-        }
-#endif
-        Tracevv((stderr, "inflate:         match %u %u\t\t! %0*lb %0*lb\n",
-                    state_length, state_offset,
-                    here2.bits, (unsigned long)bit_stash2,
-                    here.bits, (unsigned long)bit_stash));
-        // TODO: calculate this correctlyer.
-        int hardstop = CANNOT_ASSUME(NOHARDSTOP) && (avail_out < CHUNKCOPY_CHUNK_SIZE);
-        int output_so_far = (output_size - avail_out);
-        int copy = state_length;
-        if (copy > avail_out) copy = avail_out;
-
-        /* We try not to rely on the window and hope the output buffer is large enough */
-        if (__builtin_expect(state_offset > output_so_far, 0)) {         /* copy from window */
-            int windist = state_offset - output_so_far;
-            int wcopy = copy < windist ? copy : windist;
-            if (windowcopy(outptr, state->window, state->wsize, state->whave, state->wnext, windist, wcopy) != 0 && state->sane) {
+            if (state_offset > state->dmax) {
                 strm->msg = (char *)"invalid distance too far back";
                 state->mode = BAD;
                 break;
             }
-            outptr += wcopy;
-            avail_out -= wcopy;
-            copy -= wcopy;
-            state_length -= wcopy;
-            if (copy > 0) {
-                /* copy from output */
-                if (hardstop) {
-                    COPY258_OVERLAP_HARDSTOP(outptr, state_offset, copy);
-                } else {
-                    COPY258_OVERLAP_NOHARDSTOP(outptr, state_offset, copy);
+#endif
+
+            /* TODO: this might be a good place to prefetch next match code. */
+
+            Tracevv((stderr, "inflate:         match %u %u\t\t! %0*lb %0*lb\n",
+                        state_length, state_offset,
+                        distance.bits, (unsigned long)bit_stash2,
+                        match.bits, (unsigned long)bit_stash));
+            // TODO: calculate this more correctlier?
+            int output_so_far = (output_size - avail_out);
+            int copy = state_length;
+            if (copy > avail_out) copy = avail_out;
+
+            if (state_offset > output_so_far) {         /* copy from window */
+                int windist = state_offset - output_so_far;
+                int wcopy = copy < windist ? copy : windist;
+                if (windowcopy(outptr, state->window, state->wsize, state->whave, state->wnext, windist, wcopy) != 0 && state->sane) {
+                    strm->msg = (char *)"invalid distance too far back";
+                    state->mode = BAD;
+                    break;
                 }
-                outptr += copy;
-                avail_out -= copy;
-                state_length -= copy;
+                outptr += wcopy;
+                avail_out -= wcopy;
+                copy -= wcopy;
+                state_length -= wcopy;
+                output_so_far += wcopy;  // unused but the compiler should deal with it
+
+                /* avoid evaluating the below block copy with copy==0, because
+                 * that might be an unexpected case in an optimised
+                 * implementation.
+                 */
+                if (copy == 0) goto check_output_full;
             }
-        }
-        else {
             /* copy from output */
-            if (hardstop) {
+            if (CANNOT_ASSUME(NOHARDSTOP) && CANNOT_ASSUME(OUTPUT_APLENTY) && avail_out < CHUNKCOPY_CHUNK_SIZE) {
                 COPY258_OVERLAP_HARDSTOP(outptr, state_offset, copy);
-            } else {
+            }
+            else {
+                assert(CAN_ASSUME(NOHARDSTOP) || avail_out >= CHUNKCOPY_CHUNK_SIZE);
                 COPY258_OVERLAP_NOHARDSTOP(outptr, state_offset, copy);
             }
             outptr += copy;
             avail_out -= copy;
             state_length -= copy;
+
+          check_output_full:
+            if (CANNOT_ASSUME(OUTPUT_APLENTY) && state_length > 0) { /* Output doesn't fit. */
+                state->mode = MATCH;
+                state->was = state_was;
+                state->length = state_length;
+                state->offset = state_offset;
+                break;
+            }
         }
-        if (state_length > 0) {
-            state->mode = MATCH;
-            state->was = state_was;
-            state->length = state_length;
-            state->offset = state_offset;
-            // TODO: check this:
-            REPLACEBITS();
-            state->back = state->bits - bits;
-            RESTORE();
-            return;
+        else if (match.op == 32) {
+            Tracevv((stderr, "inflate:         end of block\n"));
+            state->mode = TYPE;
+            break;
+        }
+        else {
+            strm->msg = (char *)"invalid literal/length code";
+            state->mode = BAD;
+            break;
         }
     }
-    state->back = -1;
-    REPLACEBITS();
+
+    /* TODO: What's going on that we really need this here? */
+    int replace_size = bits >> 3;
+    bits -= replace_size * 8;
+    hold &= ~(~0ull << bits);
+    inptr -= replace_size;
+    avail_in += replace_size;
+
+    if (state->mode == LEN) {
+        state->back = -1;
+    }
+    else {
+        state->back = state->bits - bits;
+    }
+
     RESTORE();
     return;
 
   input_empty:
-    if (CAN_ASSUME(INPUT_APLENTY)) {
-        Tracev((stderr, "Input low: avail_in:%d, hold:%0*lb (%d bits)\n", avail_in, bits, hold, bits));
-    }
-    else {
+    if (CANNOT_ASSUME(INPUT_APLENTY)) {
+        /* Broke out mid-symbol; we need to walk back to the beginning of the
+         * symbol so we can return a consistent state. */
         hold = hold_rewind;
         bits = bits_rewind;
         Tracev((stderr, "Out of input: avail_in:%d, hold:%0*lb (%d bits)\n", avail_in, bits, hold, bits));
-        // assert(avail_in == 0);
+        assert(avail_in == 0);
+    }
+    else {
+        /* Broke out before trying to interpret next symbol. */
+        Tracev((stderr, "Input low: avail_in:%d, hold:%0*lb (%d bits)\n", avail_in, bits, hold, bits));
     }
     RESTORE();
     state->back = 0;
@@ -495,42 +504,61 @@ static INLINE_ALWAYS void inflate_fastish_core(struct inflate_state FAR *state, 
 }
 
 static INLINE_NEVER void inflate_fastest(struct inflate_state FAR *state, z_streamp strm, unsigned output_size) {
-    inflate_fastish_core(state, strm, output_size, ASSUME_INPUT_APLENTY | ASSUME_OUTPUT_APLENTY);
+    inflate_core_impl(state, strm, output_size, TARGET_EXTRA_ASSUMPTIONS | ASSUME_INPUT_APLENTY | ASSUME_OUTPUT_APLENTY);
 }
 
-static INLINE_NEVER void inflate_fasterish(struct inflate_state FAR *state, z_streamp strm, unsigned output_size) {
-    inflate_fastish_core(state, strm, output_size, ASSUME_INPUT_APLENTY);
+static INLINE_NEVER void inflate_faster(struct inflate_state FAR *state, z_streamp strm, unsigned output_size) {
+    inflate_core_impl(state, strm, output_size, TARGET_EXTRA_ASSUMPTIONS | ASSUME_INPUT_APLENTY);
 }
 
 static INLINE_NEVER void inflate_tail(struct inflate_state FAR *state, z_streamp strm, unsigned output_size) {
-    inflate_fastish_core(state, strm, output_size, 0);
+    inflate_core_impl(state, strm, output_size, TARGET_EXTRA_ASSUMPTIONS);
 }
 
-int ZLIB_INTERNAL inffast_wincopy(uint8_t* outptr, uint8_t const* window, int wsize, int whave, int wnext, int offset, int copy) {
-    return windowcopy(outptr, window, wsize, whave, wnext, offset, copy);
-}
-
-void ZLIB_INTERNAL inffast_outcopy(uint8_t* outptr, int distance, int length) {
-    COPY258_OVERLAP_HARDSTOP(outptr, distance, length);
-}
-
-void ZLIB_INTERNAL inflate_fastish(z_streamp strm, unsigned output_size) {
+void ZLIB_INTERNAL inflate_core(z_streamp strm, unsigned output_size) {
     struct inflate_state FAR *state = (struct inflate_state FAR *)strm->state;
-    inflate_fastest(state, strm, output_size);
-    if (state->mode == LEN) inflate_fasterish(state, strm, output_size);
-    if (state->mode == LEN) inflate_tail(state, strm, output_size);
-#ifdef ZLIB_DEBUG
-    if (state->mode == LEN) {
-        if (strm->avail_in > 0 && strm->avail_out > 0) {
-            Trace((stderr, "Problem: invalid state for LEN return: avail_in:%u, avail_out:%u, len:%u\n", strm->avail_in, strm->avail_out, state->length));
+
+    if (state->mode == MATCH) {
+        /* Occasionally the previous back reference will be left incomplete
+         * because there wasn't enough output buffer.  In that case, pick
+         * up the leftovers here, before re-entering the main loop above.
+         */
+        int output_so_far = (output_size - strm->avail_out);
+        int copy = state->length;
+        if (copy > strm->avail_out) copy = strm->avail_out;
+
+        if (state->offset > output_so_far) {         /* copy from window */
+            int windist = state->offset - output_so_far;
+            int wcopy = copy < windist ? copy : windist;
+            if (windowcopy(strm->next_out, state->window, state->wsize, state->whave, state->wnext, windist, wcopy) != 0 && state->sane) {
+                strm->msg = (char *)"invalid distance too far back";
+                state->mode = BAD;
+                return;
+            }
+            strm->next_out += wcopy;
+            strm->avail_out -= wcopy;
+            state->length -= wcopy;
+            copy -= wcopy;
         }
+        if (copy > 0) {     /* copy from output */
+            COPY258_OVERLAP_HARDSTOP(strm->next_out, state->offset, copy);
+            strm->next_out += copy;
+            strm->avail_out -= copy;
+            state->length -= copy;
+        }
+        if (state->length > 0) return;
+        state->mode = LEN;
+    }
+
+    inflate_fastest(state, strm, output_size);
+    if (state->mode == LEN) inflate_faster(state, strm, output_size);
+    if (state->mode == LEN) inflate_tail(state, strm, output_size);
+    if (state->mode == LEN) {
+        assert(strm->avail_in == 0 || strm->avail_out == 0);
     }
     else if (state->mode == MATCH) {
-        if (strm->avail_out > 0 || state->length <= 0) {
-            Trace((stderr, "Problem: invalid state for MATCH return: avail_in:%u, avail_out:%u, len:%u\n", strm->avail_in, strm->avail_out, state->length));
-        }
+        assert(strm->avail_out == 0 && state->length > 0);
     }
-#endif
 }
 
 
@@ -620,15 +648,16 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
     /* decode literals and length/distances until end-of-block or not enough
        input data or output space */
     do {
-        if (bits < 15) {
+        if (bits < 20) {
             hold += (unsigned long)(*in++) << bits;
             bits += 8;
             hold += (unsigned long)(*in++) << bits;
             bits += 8;
         }
         here = lcode + (hold & lmask);
-      dolen:
+        unsigned long oldhold = hold;
         op = (unsigned)(here->bits);
+      dolen:
         hold >>= op;
         bits -= op;
         op = (unsigned)(here->op);
@@ -641,15 +670,7 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
         else if (op & 16) {                     /* length base */
             len = (unsigned)(here->val);
             op &= 15;                           /* number of extra bits */
-            if (op) {
-                if (bits < op) {
-                    hold += (unsigned long)(*in++) << bits;
-                    bits += 8;
-                }
-                len += (unsigned)hold & ((1U << op) - 1);
-                hold >>= op;
-                bits -= op;
-            }
+            len += ((oldhold << op) >> here->bits) & ~(~0u << op);
             Tracevv((stderr, "inflate:         length %u\n", len));
             if (bits < 15) {
                 hold += (unsigned long)(*in++) << bits;
@@ -658,8 +679,9 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
                 bits += 8;
             }
             here = dcode + (hold & dmask);
-          dodist:
             op = (unsigned)(here->bits);
+            if (here->op & 16) op -= here->op & 15;
+          dodist:
             hold >>= op;
             bits -= op;
             op = (unsigned)(here->op);
@@ -782,8 +804,11 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
                     }
                 }
             }
-            else if ((op & 64) == 0) {          /* 2nd level distance code */
+            else if ((op & 96) == 0) {          /* 2nd level distance code */
+                int oldbits = here->bits;
+                op -= oldbits;
                 here = dcode + here->val + (hold & ((1U << op) - 1));
+                op = here->bits - oldbits;
                 goto dodist;
             }
             else {
@@ -792,8 +817,11 @@ void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start) {
                 break;
             }
         }
-        else if ((op & 64) == 0) {              /* 2nd level length code */
+        else if ((op & 96) == 0) {              /* 2nd level length code */
+            int oldbits = here->bits;
+            op -= oldbits;
             here = lcode + here->val + (hold & ((1U << op) - 1));
+            op = here->bits - oldbits;
             goto dolen;
         }
         else if (op & 32) {                     /* end-of-block */

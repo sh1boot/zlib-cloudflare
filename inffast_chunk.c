@@ -160,7 +160,7 @@ void ZLIB_INTERNAL inflate_fast_chunk_(z_streamp strm, unsigned start)         /
 #ifdef INFLATE_CHUNK_READ_64LE
         REFILL();
 #else
-        if (bits < 15) {
+        if (bits < 20) {
             hold += (unsigned long)(*in++) << bits;
             bits += 8;
             hold += (unsigned long)(*in++) << bits;
@@ -188,9 +188,9 @@ void ZLIB_INTERNAL inflate_fast_chunk_(z_streamp strm, unsigned start)         /
             }
         }
 #endif
-      dolen:
+        unsigned long oldhold = hold;
         op = (unsigned)(here->bits);
-        if (here->op & 16) op -= here->op & 15;
+      dolen:
         hold >>= op;
         bits -= op;
         op = (unsigned)(here->op);
@@ -203,17 +203,7 @@ void ZLIB_INTERNAL inflate_fast_chunk_(z_streamp strm, unsigned start)         /
         else if (op & 16) {                     /* length base */
             len = (unsigned)(here->val);
             op &= 15;                           /* number of extra bits */
-            if (op) {
-#ifndef INFLATE_CHUNK_READ_64LE
-                if (bits < op) {
-                    hold += (unsigned long)(*in++) << bits;
-                    bits += 8;
-                }
-#endif
-                len += (unsigned)hold & ((1U << op) - 1);
-                hold >>= op;
-                bits -= op;
-            }
+            len += ((oldhold << op) >> here->bits) & ~(~0u << op);
             Tracevv((stderr, "inflate:         length %u\n", len));
 #ifndef INFLATE_CHUNK_READ_64LE
             if (bits < 15) {
@@ -224,9 +214,9 @@ void ZLIB_INTERNAL inflate_fast_chunk_(z_streamp strm, unsigned start)         /
             }
 #endif
             here = dcode + (hold & dmask);
-          dodist:
             op = (unsigned)(here->bits);
             if (here->op & 16) op -= here->op & 15;
+          dodist:
             hold >>= op;
             bits -= op;
             op = (unsigned)(here->op);
@@ -336,8 +326,11 @@ void ZLIB_INTERNAL inflate_fast_chunk_(z_streamp strm, unsigned start)         /
                     out = chunkcopy_lapped_relaxed(out, dist, len);
                 }
             }
-            else if ((op & 64) == 0) {          /* 2nd level distance code */
+            else if ((op & 96) == 0) {          /* 2nd level distance code */
+                int oldbits = here->bits;
+                op -= oldbits;
                 here = dcode + here->val + (hold & ((1U << op) - 1));
+                op = here->bits - oldbits;
                 goto dodist;
             }
             else {
@@ -346,8 +339,11 @@ void ZLIB_INTERNAL inflate_fast_chunk_(z_streamp strm, unsigned start)         /
                 break;
             }
         }
-        else if ((op & 64) == 0) {              /* 2nd level length code */
+        else if ((op & 96) == 0) {              /* 2nd level length code */
+            int oldbits = here->bits;
+            op -= oldbits;
             here = lcode + here->val + (hold & ((1U << op) - 1));
+            op = here->bits - oldbits;
             goto dolen;
         }
         else if (op & 32) {                     /* end-of-block */

@@ -208,7 +208,7 @@ int ZLIB_INTERNAL inflate_table(codetype type, unsigned short FAR *lens,
     /* process all codes and make table entries */
     for (;;) {
         /* create table entry */
-        here.bits = (unsigned char)(len - drop);
+        here.bits = (unsigned char)len;
         if (work[sym] + 1 < match) {
             here.op = (unsigned char)0;
             here.val = work[sym];
@@ -219,7 +219,7 @@ int ZLIB_INTERNAL inflate_table(codetype type, unsigned short FAR *lens,
             if (here.op & 16) here.bits += here.op & 15;
         }
         else {
-            here.op = (unsigned char)(32 + 64);         /* end of block */
+            here.op = (unsigned char)32;         /* end of block */
             here.val = 0;
         }
 
@@ -277,7 +277,7 @@ int ZLIB_INTERNAL inflate_table(codetype type, unsigned short FAR *lens,
 
             /* point entry in root table to sub-table */
             low = huff & mask;
-            (*table)[low].op = (unsigned char)curr;
+            (*table)[low].op = (unsigned char)(curr + drop);
             (*table)[low].bits = (unsigned char)root;
             (*table)[low].val = (unsigned short)(next - *table);
         }
@@ -288,7 +288,7 @@ int ZLIB_INTERNAL inflate_table(codetype type, unsigned short FAR *lens,
        maximum code length that was allowed to get this far is one bit) */
     if (huff != 0) {
         here.op = (unsigned char)64;            /* invalid code marker */
-        here.bits = (unsigned char)(len - drop);
+        here.bits = (unsigned char)len;
         here.val = (unsigned short)0;
         next[huff] = here;
     }
