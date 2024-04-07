@@ -290,6 +290,10 @@ endif()
 #============================================================================
 
 if(BUILD_EXAMPLES)
+    add_executable(zpipe examples/zpipe.c)
+    target_link_libraries(zpipe zlib -static)
+    set_target_properties(zpipe PROPERTIES COMPILE_FLAGS "-D_FILE_OFFSET_BITS=64")
+
     add_executable(example test/example.c)
     target_link_libraries(example zlib)
     set_target_properties(example PROPERTIES COMPILE_FLAGS "-D_FILE_OFFSET_BITS=64")

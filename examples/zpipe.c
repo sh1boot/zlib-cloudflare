@@ -190,8 +190,11 @@ int main(int argc, char **argv)
     }
 
     /* do decompression if -d specified */
-    else if (argc == 2 && strcmp(argv[1], "-d") == 0) {
-        ret = inf(stdin, stdout);
+    else if (argc >= 2 && strcmp(argv[1], "-d") == 0) {
+        FILE* in = stdin, *out = stdout;
+        if (argc >= 3) in = fopen(argv[2], "rb");
+        if (argc >= 4) out = fopen(argv[3], "wb");
+        ret = inf(in, out);
         if (ret != Z_OK)
             zerr(ret);
         return ret;
