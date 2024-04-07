@@ -216,6 +216,7 @@ int ZLIB_INTERNAL inflate_table(codetype type, unsigned short FAR *lens,
         else if (work[sym] >= match) {
             here.op = (unsigned char)(extra[work[sym] - match]);
             here.val = base[work[sym] - match];
+            if (here.op & 16) here.bits += here.op & 15;
         }
         else {
             here.op = (unsigned char)(32 + 64);         /* end of block */

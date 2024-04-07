@@ -190,6 +190,7 @@ void ZLIB_INTERNAL inflate_fast_chunk_(z_streamp strm, unsigned start)         /
 #endif
       dolen:
         op = (unsigned)(here->bits);
+        if (here->op & 16) op -= here->op & 15;
         hold >>= op;
         bits -= op;
         op = (unsigned)(here->op);
@@ -225,6 +226,7 @@ void ZLIB_INTERNAL inflate_fast_chunk_(z_streamp strm, unsigned start)         /
             here = dcode + (hold & dmask);
           dodist:
             op = (unsigned)(here->bits);
+            if (here->op & 16) op -= here->op & 15;
             hold >>= op;
             bits -= op;
             op = (unsigned)(here->op);

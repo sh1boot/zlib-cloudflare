@@ -87,9 +87,8 @@
 #if defined(INFLATE_CHUNK_SIMD_NEON) || defined(INFLATE_CHUNK_SIMD_SSE2) || defined(INFLATE_CHUNK_GENERIC)
 #include "inffast_chunk.h"
 #include "chunkcopy.h"
-#else
-#include "inffast.h"
 #endif
+#include "inffast.h"
 
 #ifdef MAKEFIXED
 #  ifndef BUILDFIXED
@@ -528,7 +527,7 @@ static int updatewindow(z_streamp strm, const Bytef *end, unsigned copy) {
     ((unsigned)hold & ((1UL << (n)) - 1))
 /* Return the low n bits of the bit accumulator (n <= 32) */
 #define BITS_L(n) \
-    (hold & ~(~0ULL << (n)))
+    (hold & ~(~0ull << (n)))
 
 /* Remove n bits from the bit accumulator */
 #define DROPBITS(n) \
@@ -1092,6 +1091,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
             state->mode = LEN;
                 /* fallthrough */
         case LEN:
+#if 0 // TODO: re-enable
             if (have >= INFLATE_FAST_MIN_INPUT &&
                 left >= INFLATE_FAST_MIN_OUTPUT) {
                 RESTORE();
@@ -1105,166 +1105,52 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
                     state->back = -1;
                 break;
             }
-            state->back = 0;
-            for (;;) {
-                here = state->lencode[BITS(state->lenbits)];
-                if ((unsigned)(here.bits) <= bits) break;
-                PULLBYTE();
-            }
-            if (here.op && (here.op & 0xf0) == 0) {
-                last = here;
-                for (;;) {
-                    here = state->lencode[last.val +
-                            (BITS(last.bits + last.op) >> last.bits)];
-                    if ((unsigned)(last.bits + here.bits) <= bits) break;
-                    PULLBYTE();
-                }
-                DROPBITS(last.bits);
-                state->back += last.bits;
-            }
-            DROPBITS(here.bits);
-            state->back += here.bits;
-            state->length = (unsigned)here.val;
-            if ((int)(here.op) == 0) {
-                Tracevv((stderr, here.val >= 0x20 && here.val < 0x7f ?
-                        "inflate:         literal '%c'\n" :
-                        "inflate:         literal 0x%02x\n", here.val));
-                state->mode = LIT;
-                break;
-            }
-            if (here.op & 32) {
-                Tracevv((stderr, "inflate:         end of block\n"));
-                state->back = -1;
-                state->mode = TYPE;
-                break;
-            }
-            if (here.op & 64) {
-                strm->msg = (char *)"invalid literal/length code";
-                state->mode = BAD;
-                break;
-            }
-            state->extra = (unsigned)(here.op) & 15;
-            state->mode = LENEXT;
-                /* fallthrough */
-        case LENEXT:
-            if (state->extra) {
-                NEEDBITS(state->extra);
-                state->length += BITS(state->extra);
-                DROPBITS(state->extra);
-                state->back += state->extra;
-            }
-            Tracevv((stderr, "inflate:         length %u\n", state->length));
-            state->was = state->length;
-            state->mode = DIST;
-                /* fallthrough */
-        case DIST:
-            for (;;) {
-                here = state->distcode[BITS(state->distbits)];
-                if ((unsigned)(here.bits) <= bits) break;
-                PULLBYTE();
-            }
-            if ((here.op & 0xf0) == 0) {
-                last = here;
-                for (;;) {
-                    here = state->distcode[last.val +
-                            (BITS(last.bits + last.op) >> last.bits)];
-                    if ((unsigned)(last.bits + here.bits) <= bits) break;
-                    PULLBYTE();
-                }
-                DROPBITS(last.bits);
-                state->back += last.bits;
-            }
-            DROPBITS(here.bits);
-            state->back += here.bits;
-            if (here.op & 64) {
-                strm->msg = (char *)"invalid distance code";
-                state->mode = BAD;
-                break;
-            }
-            state->offset = (unsigned)here.val;
-            state->extra = (unsigned)(here.op) & 15;
-            state->mode = DISTEXT;
-                /* fallthrough */
-        case DISTEXT:
-            if (state->extra) {
-                NEEDBITS(state->extra);
-                state->offset += BITS(state->extra);
-                DROPBITS(state->extra);
-                state->back += state->extra;
-            }
-#ifdef INFLATE_STRICT
-            if (state->offset > state->dmax) {
-                strm->msg = (char *)"invalid distance too far back";
-                state->mode = BAD;
-                break;
-            }
 #endif
-            Tracevv((stderr, "inflate:         distance %u\n", state->offset));
-            state->mode = MATCH;
-                /* fallthrough */
-        case MATCH:
             if (left == 0) goto inf_leave;
-            copy = out - left;
-            if (state->offset > copy) {         /* copy from window */
-                copy = state->offset - copy;
-                if (copy > state->whave) {
-                    if (state->sane) {
+            RESTORE();
+            inflate_fastish(strm, out);
+            LOAD();
+            if (state->mode != LEN && state->mode != MATCH) {
+                Tracev((stderr, "continuing main loop because mode is %d.\n",
+                        (int)(state->mode)));
+                break;
+            }
+            goto inf_leave;
+        case MATCH:
+            /* Occasionally the previous back reference will be left incomplete
+             * because there wasn't enough output buffer.  In that case, pick
+             * up the leftovers here, before re-entering the main loop above.
+             */
+            if (left == 0) goto inf_leave;
+            {
+                int output_so_far = (out - left);
+                copy = state->length;
+                if (copy > left) copy = left;
+
+                /* We try not to rely on the window and hope the output buffer is large enough */
+                if (__builtin_expect(state->offset > output_so_far, 0)) {         /* copy from window */
+                    int windist = state->offset - output_so_far;
+                    int wcopy = copy < windist ? copy : windist;
+                    if (inffast_wincopy(put, state->window, state->wsize, state->whave, state->wnext, windist, wcopy) != 0 && state->sane) {
                         strm->msg = (char *)"invalid distance too far back";
                         state->mode = BAD;
                         break;
                     }
-#ifdef INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR
-                    Trace((stderr, "inflate.c too far\n"));
-                    copy -= state->whave;
-                    if (copy > state->length) copy = state->length;
-                    if (copy > left) copy = left;
-                    left -= copy;
-                    state->length -= copy;
-                    do {
-                        *put++ = 0;
-                    } while (--copy);
+                    put += wcopy;
+                    left -= wcopy;
+                    copy -= wcopy;
+                    state->length -= wcopy;
                     if (state->length == 0) state->mode = LEN;
-                    break;
-#endif
+                    if (copy == 0) break;
                 }
-                if (copy > state->wnext) {
-                    copy -= state->wnext;
-                    from = state->window + (state->wsize - copy);
-                }
-                else
-                    from = state->window + (state->wnext - copy);
-                if (copy > state->length) copy = state->length;
-#if defined(INFLATE_CHUNK_SIMD_NEON) || defined(INFLATE_CHUNK_SIMD_SSE2) || defined(INFLATE_CHUNK_GENERIC)
-                if (copy > left) copy = left;
-                put = chunkcopy_safe(put, from, copy, put + left);
+
+                /* copy from output */
+                inffast_outcopy(put, state->offset, copy);
+                put += copy;
+                left -= copy;
+                state->length -= copy;
+                if (state->length == 0) state->mode = LEN;
             }
-            else {                              /* copy from output */
-                copy = state->length;
-                if (copy > left) copy = left;
-                put = chunkcopy_lapped_safe(put, state->offset, copy, put + left);
-            }
-            left -= copy;
-            state->length -= copy;
-#else
-            }
-            else {                              /* copy from output */
-                from = put - state->offset;
-                copy = state->length;
-            }
-            if (copy > left) copy = left;
-            left -= copy;
-            state->length -= copy;
-            do {
-                *put++ = *from++;
-            } while (--copy);
-#endif
-            if (state->length == 0) state->mode = LEN;
-            break;
-        case LIT:
-            if (left == 0) goto inf_leave;
-            *put++ = (unsigned char)(state->length);
-            left--;
-            state->mode = LEN;
             break;
         case CHECK:
             if (state->wrap) {

@@ -24,3 +24,9 @@
 #define INFLATE_FAST_MIN_OUTPUT 258
 
 void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start);
+int ZLIB_INTERNAL inffast_wincopy(uint8_t* put, uint8_t const* window,
+                                  int wsize, int whave, int wnext,
+                                  int offset, int copy);
+void ZLIB_INTERNAL inffast_outcopy(uint8_t* put, int distance,
+                                   int length);
+void ZLIB_INTERNAL inflate_fastish(z_streamp strm, unsigned output_size);
